@@ -59,7 +59,6 @@ python -u run.py \
   --e_layers $e_layers \
   --n_heads $n_heads \
   --num_workers $num_workers \
-  --gpu 0 \
   --cosine \
   --tmax $train_epochs \
   --valid_last \
