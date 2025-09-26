@@ -597,6 +597,90 @@ class UTSD(Dataset):
         return self.n_window_list[-1]
 
 
+class NegoCompletionDataset(Dataset):
+    def __init__(self, root_path, flag='train', size=None, data_path='', scale=False, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0, min_input_len=1000):
+        self.min_input_len = min_input_len
+        self.flag = flag
+        assert flag in ['train', 'test', 'val']
+        type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = type_map[flag]
+        self.scale = scale
+        self.nonautoregressive = nonautoregressive
+        self.split = split
+        self.stride = stride
+        self.data_list = []
+        self.completion_pairs = []  # (session_idx, split_point)
+        self.root_path = root_path
+        self.__confirm_data__()
+
+    def __confirm_data__(self):
+        session_idx = 0
+        for root, dirs, files in os.walk(self.root_path):
+            for file in files:
+                if file.endswith('.csv'):
+                    dataset_path = os.path.join(root, file)
+
+                    df_raw = pd.read_csv(dataset_path)
+
+                    if isinstance(df_raw[df_raw.columns[0]][0], str):
+                        data = df_raw[df_raw.columns[1:]].values
+                    else:
+                        data = df_raw.values
+
+                    # Train/val/test split for this session
+                    num_train = int(len(data) * self.split)
+                    num_test = int(len(data) * (1 - self.split) / 2)
+                    num_vali = len(data) - num_train - num_test
+
+                    # Check if session has minimum length
+                    if num_train < self.min_input_len + 1:  # Need min_input + at least 1 output
+                        continue
+
+                    border1s = [0, num_train, len(data) - num_test]
+                    border2s = [num_train, num_train + num_vali, len(data)]
+
+                    border1 = border1s[self.set_type]
+                    border2 = border2s[self.set_type]
+
+                    session_data = data[border1:border2]
+
+                    # Check if this split has minimum length
+                    if len(session_data) < self.min_input_len + 1:
+                        continue
+
+                    self.data_list.append(session_data)
+
+                    # Generate all valid completion pairs for this session
+                    session_length = len(session_data)
+                    for split_point in range(self.min_input_len, session_length, self.stride):
+                        self.completion_pairs.append((session_idx, split_point))
+
+                    session_idx += 1
+
+        print(f"Total number of completion pairs in negotiation dataset: {len(self.completion_pairs)}")
+
+    def __getitem__(self, index):
+        session_idx, split_point = self.completion_pairs[index]
+        session_data = self.data_list[session_idx]
+
+        # Extract input and target sequences
+        input_seq = session_data[:split_point]  # [0:split_point]
+        target_seq = session_data[split_point:]  # [split_point:end]
+
+        # Convert to tensors
+        seq_x = torch.tensor(input_seq, dtype=torch.float32)
+        seq_y = torch.tensor(target_seq, dtype=torch.float32)
+
+        # Create time marks (zeros as in original implementation)
+        seq_x_mark = torch.zeros((seq_x.shape[0], 1))
+        seq_y_mark = torch.zeros((seq_y.shape[0], 1))
+
+        return seq_x, seq_y, seq_x_mark, seq_y_mark
+
+    def __len__(self):
+        return len(self.completion_pairs)
+
+
 # Download link: https://cloud.tsinghua.edu.cn/f/93868e3a9fb144fe9719/
 class UTSD_Npy(Dataset):
     def __init__(self, root_path, flag='train', size=None, data_path='ETTh1.csv', scale=True, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0):
