@@ -612,85 +612,90 @@ class NegotiationDataset(Dataset):
         self.nonautoregressive = nonautoregressive
         self.split = split
         self.stride = stride
-        self.data_list = []
-        self.n_window_list = []
+        self.data_list = []  # List of (data, timestamps) tuples for each session
+        self.n_window_list = []  # Cumulative window counts for indexing
         self.root_path = root_path
         self.__confirm_data__()
 
     def __confirm_data__(self):
-        for root, _, files in os.walk(self.root_path):
-            for file in files:
-                if file.endswith('.csv'):
-                    dataset_path = os.path.join(root, file)
+        # Load CSV files from the appropriate split directory
+        split_dir = os.path.join(self.root_path, self.flag)
 
-                    df_raw = pd.read_csv(dataset_path)
+        if not os.path.exists(split_dir):
+            print(f"Warning: Split directory {split_dir} does not exist")
+            return
 
-                    # Extract features (exclude unique_id and target y)
-                    feature_cols = [col for col in df_raw.columns if col not in ['unique_id', 'y']]
-                    features = df_raw[feature_cols].values
-                    targets = df_raw['y'].values.reshape(-1, 1)
+        for file in os.listdir(split_dir):
+            if file.endswith('.csv'):
+                dataset_path = os.path.join(split_dir, file)
+                df_raw = pd.read_csv(dataset_path)
 
-                    # Combine features and targets for unified processing
-                    data = np.column_stack([features, targets])
+                # Extract timestamps for time marks
+                timestamps = df_raw['ds'].values.astype(np.float32)
 
-                    # Split data into train/val/test
-                    num_train = int(len(data) * self.split)
-                    num_test = int(len(data) * (1 - self.split) / 2)
-                    num_vali = len(data) - num_train - num_test
+                # Extract only actual features (exclude unique_id and ds timestamp)
+                feature_cols = [col for col in df_raw.columns if col not in ['unique_id', 'ds']]
+                data = df_raw[feature_cols].values.astype(np.float32)
 
-                    if num_train < self.context_len:
-                        continue
+                # Use entire session (no temporal splitting)
+                session_data = data
+                session_timestamps = timestamps
 
-                    border1s = [0, num_train - self.seq_len, len(data) - num_test - self.seq_len]
-                    border2s = [num_train, num_train + num_vali, len(data)]
+                # Calculate number of time windows for this session
+                n_timepoint = len(session_data) - self.seq_len - self.output_token_len + 1
+                if n_timepoint <= 0:
+                    continue
 
-                    border1 = border1s[self.set_type]
-                    border2 = border2s[self.set_type]
+                self.data_list.append((session_data, session_timestamps))
 
-                    data = data[border1:border2]
-                    n_timepoint = (len(data) - self.context_len) // self.stride + 1
-                    n_var = data.shape[1]
-                    self.data_list.append(data)
-
-                    n_window = n_timepoint * n_var
-                    self.n_window_list.append(n_window if len(self.n_window_list) == 0 else self.n_window_list[-1] + n_window)
+                # Track cumulative window count
+                total_windows = n_timepoint if len(self.n_window_list) == 0 else self.n_window_list[-1] + n_timepoint
+                self.n_window_list.append(total_windows)
 
         print(f"Total number of windows in negotiation dataset: {self.n_window_list[-1] if self.n_window_list else 0}")
 
     def __getitem__(self, index):
         assert index >= 0
 
-        # Find the location of one dataset by the index
+        # Find which session this index belongs to
         dataset_index = 0
-        while index >= self.n_window_list[dataset_index]:
+        while dataset_index < len(self.n_window_list) and index >= self.n_window_list[dataset_index]:
             dataset_index += 1
 
-        index = index - self.n_window_list[dataset_index - 1] if dataset_index > 0 else index
-        n_timepoint = (len(self.data_list[dataset_index]) - self.context_len) // self.stride + 1
+        # Calculate local index within the session
+        local_index = index - (self.n_window_list[dataset_index - 1] if dataset_index > 0 else 0)
 
-        c_begin = index // n_timepoint  # select variable
-        s_begin = index % n_timepoint   # select start timestamp
-        s_begin = self.stride * s_begin
+        # Get session data and timestamps
+        session_data, session_timestamps = self.data_list[dataset_index]
+
+        # Calculate time window boundaries
+        s_begin = local_index
         s_end = s_begin + self.seq_len
 
         if not self.nonautoregressive:
             r_begin = s_begin + self.input_token_len
             r_end = s_end + self.output_token_len
 
-            seq_x = self.data_list[dataset_index][s_begin:s_end, c_begin:c_begin + 1]
-            seq_y = self.data_list[dataset_index][r_begin:r_end, c_begin:c_begin + 1]
-            seq_y = torch.tensor(seq_y)
+            seq_x = session_data[s_begin:s_end]      # Features only (no timestamp)
+            seq_y = session_data[r_begin:r_end]      # Features only (no timestamp), future time
+            seq_y = torch.tensor(seq_y, dtype=torch.float32)
             seq_y = seq_y.unfold(dimension=0, size=self.output_token_len,
                                 step=self.input_token_len).permute(0, 2, 1)
             seq_y = seq_y.reshape(seq_y.shape[0] * seq_y.shape[1], -1)
         else:
             r_begin = s_end
             r_end = r_begin + self.output_token_len
-            seq_x = self.data_list[dataset_index][s_begin:s_end, c_begin:c_begin + 1]
-            seq_y = self.data_list[dataset_index][r_begin:r_end, c_begin:c_begin + 1]
+            seq_x = session_data[s_begin:s_end]      # Features only (no timestamp)
+            seq_y = session_data[r_begin:r_end]      # Features only (no timestamp), future time
 
-        seq_x_mark = torch.zeros((seq_x.shape[0], 1))
-        seq_y_mark = torch.zeros((seq_x.shape[0], 1))
+        seq_x = torch.tensor(seq_x, dtype=torch.float32)
+        if not isinstance(seq_y, torch.Tensor):
+            seq_y = torch.tensor(seq_y, dtype=torch.float32)
+
+        # Use actual timestamps for time marks
+        seq_x_mark = torch.tensor(session_timestamps[s_begin:s_end].reshape(-1, 1), dtype=torch.float32)
+        seq_y_mark = torch.tensor(session_timestamps[r_begin:r_end].reshape(-1, 1), dtype=torch.float32)
+
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
