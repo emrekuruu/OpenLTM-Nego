@@ -597,9 +597,13 @@ class UTSD(Dataset):
         return self.n_window_list[-1]
 
 
-class NegoCompletionDataset(Dataset):
-    def __init__(self, root_path, flag='train', size=None, data_path='', scale=False, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0, min_input_len=1000):
-        self.min_input_len = min_input_len
+# Download link: https://cloud.tsinghua.edu.cn/f/93868e3a9fb144fe9719/
+class NegotiationDataset(Dataset):
+    def __init__(self, root_path, flag='train', size=None, data_path='', scale=False, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0):
+        self.seq_len = size[0]
+        self.input_token_len = size[1]
+        self.output_token_len = size[2]
+        self.context_len = self.seq_len + self.output_token_len
         self.flag = flag
         assert flag in ['train', 'test', 'val']
         type_map = {'train': 0, 'val': 1, 'test': 2}
@@ -609,79 +613,90 @@ class NegoCompletionDataset(Dataset):
         self.split = split
         self.stride = stride
         self.data_list = []
-        self.completion_pairs = []  # (session_idx, split_point)
+        self.n_window_list = []
         self.root_path = root_path
         self.__confirm_data__()
 
     def __confirm_data__(self):
-        session_idx = 0
-        for root, dirs, files in os.walk(self.root_path):
+        for root, _, files in os.walk(self.root_path):
             for file in files:
                 if file.endswith('.csv'):
                     dataset_path = os.path.join(root, file)
 
                     df_raw = pd.read_csv(dataset_path)
 
-                    if isinstance(df_raw[df_raw.columns[0]][0], str):
-                        data = df_raw[df_raw.columns[1:]].values
-                    else:
-                        data = df_raw.values
+                    # Extract features (exclude unique_id and target y)
+                    feature_cols = [col for col in df_raw.columns if col not in ['unique_id', 'y']]
+                    features = df_raw[feature_cols].values
+                    targets = df_raw['y'].values.reshape(-1, 1)
 
-                    # Train/val/test split for this session
+                    # Combine features and targets for unified processing
+                    data = np.column_stack([features, targets])
+
+                    # Split data into train/val/test
                     num_train = int(len(data) * self.split)
                     num_test = int(len(data) * (1 - self.split) / 2)
                     num_vali = len(data) - num_train - num_test
 
-                    # Check if session has minimum length
-                    if num_train < self.min_input_len + 1:  # Need min_input + at least 1 output
+                    if num_train < self.context_len:
                         continue
 
-                    border1s = [0, num_train, len(data) - num_test]
+                    border1s = [0, num_train - self.seq_len, len(data) - num_test - self.seq_len]
                     border2s = [num_train, num_train + num_vali, len(data)]
 
                     border1 = border1s[self.set_type]
                     border2 = border2s[self.set_type]
 
-                    session_data = data[border1:border2]
+                    data = data[border1:border2]
+                    n_timepoint = (len(data) - self.context_len) // self.stride + 1
+                    n_var = data.shape[1]
+                    self.data_list.append(data)
 
-                    # Check if this split has minimum length
-                    if len(session_data) < self.min_input_len + 1:
-                        continue
+                    n_window = n_timepoint * n_var
+                    self.n_window_list.append(n_window if len(self.n_window_list) == 0 else self.n_window_list[-1] + n_window)
 
-                    self.data_list.append(session_data)
-
-                    # Generate all valid completion pairs for this session
-                    session_length = len(session_data)
-                    for split_point in range(self.min_input_len, session_length, self.stride):
-                        self.completion_pairs.append((session_idx, split_point))
-
-                    session_idx += 1
-
-        print(f"Total number of completion pairs in negotiation dataset: {len(self.completion_pairs)}")
+        print(f"Total number of windows in negotiation dataset: {self.n_window_list[-1] if self.n_window_list else 0}")
 
     def __getitem__(self, index):
-        session_idx, split_point = self.completion_pairs[index]
-        session_data = self.data_list[session_idx]
+        assert index >= 0
 
-        # Extract input and target sequences
-        input_seq = session_data[:split_point]  # [0:split_point]
-        target_seq = session_data[split_point:]  # [split_point:end]
+        # Find the location of one dataset by the index
+        dataset_index = 0
+        while index >= self.n_window_list[dataset_index]:
+            dataset_index += 1
 
-        # Convert to tensors
-        seq_x = torch.tensor(input_seq, dtype=torch.float32)
-        seq_y = torch.tensor(target_seq, dtype=torch.float32)
+        index = index - self.n_window_list[dataset_index - 1] if dataset_index > 0 else index
+        n_timepoint = (len(self.data_list[dataset_index]) - self.context_len) // self.stride + 1
 
-        # Create time marks (zeros as in original implementation)
+        c_begin = index // n_timepoint  # select variable
+        s_begin = index % n_timepoint   # select start timestamp
+        s_begin = self.stride * s_begin
+        s_end = s_begin + self.seq_len
+
+        if not self.nonautoregressive:
+            r_begin = s_begin + self.input_token_len
+            r_end = s_end + self.output_token_len
+
+            seq_x = self.data_list[dataset_index][s_begin:s_end, c_begin:c_begin + 1]
+            seq_y = self.data_list[dataset_index][r_begin:r_end, c_begin:c_begin + 1]
+            seq_y = torch.tensor(seq_y)
+            seq_y = seq_y.unfold(dimension=0, size=self.output_token_len,
+                                step=self.input_token_len).permute(0, 2, 1)
+            seq_y = seq_y.reshape(seq_y.shape[0] * seq_y.shape[1], -1)
+        else:
+            r_begin = s_end
+            r_end = r_begin + self.output_token_len
+            seq_x = self.data_list[dataset_index][s_begin:s_end, c_begin:c_begin + 1]
+            seq_y = self.data_list[dataset_index][r_begin:r_end, c_begin:c_begin + 1]
+
         seq_x_mark = torch.zeros((seq_x.shape[0], 1))
-        seq_y_mark = torch.zeros((seq_y.shape[0], 1))
-
+        seq_y_mark = torch.zeros((seq_x.shape[0], 1))
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
     def __len__(self):
-        return len(self.completion_pairs)
+        return self.n_window_list[-1] if self.n_window_list else 0
 
 
-# Download link: https://cloud.tsinghua.edu.cn/f/93868e3a9fb144fe9719/
 class UTSD_Npy(Dataset):
     def __init__(self, root_path, flag='train', size=None, data_path='ETTh1.csv', scale=True, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0):
         self.seq_len = size[0]
