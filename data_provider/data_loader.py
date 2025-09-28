@@ -597,7 +597,6 @@ class UTSD(Dataset):
         return self.n_window_list[-1]
 
 
-# Download link: https://cloud.tsinghua.edu.cn/f/93868e3a9fb144fe9719/
 class NegotiationDataset(Dataset):
     def __init__(self, root_path, flag='train', size=None, data_path='', scale=False, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0):
         self.seq_len = size[0]
@@ -701,7 +700,7 @@ class NegotiationDataset(Dataset):
     def __len__(self):
         return self.n_window_list[-1] if self.n_window_list else 0
 
-
+# Download link: https://cloud.tsinghua.edu.cn/f/93868e3a9fb144fe9719/
 class UTSD_Npy(Dataset):
     def __init__(self, root_path, flag='train', size=None, data_path='ETTh1.csv', scale=True, nonautoregressive=False, stride=1, split=0.9, test_flag='T', subset_rand_ratio=1.0):
         self.seq_len = size[0]
