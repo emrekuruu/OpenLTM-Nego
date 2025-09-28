@@ -138,4 +138,4 @@ dmypy.json
 /checkpoints/
 /test_results/
 checkpoint.pth
-*/data/
+**/data/

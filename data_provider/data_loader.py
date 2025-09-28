@@ -611,7 +611,7 @@ class NegotiationDataset(Dataset):
         self.nonautoregressive = nonautoregressive
         self.split = split
         self.stride = stride
-        self.data_list = []  # List of (data, timestamps) tuples for each session
+        self.data_list = []  # List of session data arrays
         self.n_window_list = []  # Cumulative window counts for indexing
         self.root_path = root_path
         self.__confirm_data__()
@@ -629,23 +629,19 @@ class NegotiationDataset(Dataset):
                 dataset_path = os.path.join(split_dir, file)
                 df_raw = pd.read_csv(dataset_path)
 
-                # Extract timestamps for time marks
-                timestamps = df_raw['ds'].values.astype(np.float32)
-
                 # Extract only actual features (exclude unique_id and ds timestamp)
                 feature_cols = [col for col in df_raw.columns if col not in ['unique_id', 'ds']]
                 data = df_raw[feature_cols].values.astype(np.float32)
 
                 # Use entire session (no temporal splitting)
                 session_data = data
-                session_timestamps = timestamps
 
                 # Calculate number of time windows for this session
                 n_timepoint = len(session_data) - self.seq_len - self.output_token_len + 1
                 if n_timepoint <= 0:
                     continue
 
-                self.data_list.append((session_data, session_timestamps))
+                self.data_list.append(session_data)
 
                 # Track cumulative window count
                 total_windows = n_timepoint if len(self.n_window_list) == 0 else self.n_window_list[-1] + n_timepoint
@@ -664,8 +660,8 @@ class NegotiationDataset(Dataset):
         # Calculate local index within the session
         local_index = index - (self.n_window_list[dataset_index - 1] if dataset_index > 0 else 0)
 
-        # Get session data and timestamps
-        session_data, session_timestamps = self.data_list[dataset_index]
+        # Get session data
+        session_data = self.data_list[dataset_index]
 
         # Calculate time window boundaries
         s_begin = local_index
@@ -691,9 +687,9 @@ class NegotiationDataset(Dataset):
         if not isinstance(seq_y, torch.Tensor):
             seq_y = torch.tensor(seq_y, dtype=torch.float32)
 
-        # Use actual timestamps for time marks
-        seq_x_mark = torch.tensor(session_timestamps[s_begin:s_end].reshape(-1, 1), dtype=torch.float32)
-        seq_y_mark = torch.tensor(session_timestamps[r_begin:r_end].reshape(-1, 1), dtype=torch.float32)
+        # Use zero time marks to match OpenLTM/Timer pattern
+        seq_x_mark = torch.zeros((seq_x.shape[0], 1))
+        seq_y_mark = torch.zeros((seq_x.shape[0], 1))
 
         return seq_x, seq_y, seq_x_mark, seq_y_mark
 
